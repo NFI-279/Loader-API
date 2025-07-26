@@ -111,7 +111,7 @@
     </ClCompile>
     <Link>
       <GenerateDebugInformation>true</GenerateDebugInformation>
-      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dxgi.lib;freetype.lib;cpr.lib;libcurl-d.lib;zlibd.lib;zlib.lib;ws2_32.lib;crypt32.lib;bcrypt.lib;%(AdditionalDependencies)</AdditionalDependencies>
+      <AdditionalDependencies>d3d11.lib;d3dcompiler.lib;dxgi.lib;freetype.lib;cpr.lib;libcurl-d.lib;zlibd.lib;zlib.lib;ws2_32.lib;crypt32.lib;bcrypt.lib;shell32.lib;%(AdditionalDependencies)</AdditionalDependencies>
       <AdditionalLibraryDirectories>C:\Users\svgca\Desktop\vcpkg-master\installed\x64-windows\debug\lib;C:\Users\svgca\Downloads\imgui-master\examples\example_win32_directx11\vcpkg_installed\x64-windows\x64-windows\debug\lib;C:\Users\svgca\Desktop\vcpkg-master\installed\x64-windows\lib;$(DXSDK_DIR)/Lib/x64;%(AdditionalLibraryDirectories)</AdditionalLibraryDirectories>
       <SubSystem>Console</SubSystem>
       <EntryPointSymbol>mainCRTStartup</EntryPointSymbol>
@@ -167,6 +167,7 @@
     <ClInclude Include="..\..\backends\imgui_impl_win32.h" />
     <ClInclude Include="Fonts.h" />
     <ClInclude Include="SHA256\sha256.h" />
+    <ClInclude Include="XOR\xorstr.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\imgui.cpp" />

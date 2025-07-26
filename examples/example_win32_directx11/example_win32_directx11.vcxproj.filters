@@ -28,6 +28,7 @@
       <Filter>sources</Filter>
     </ClInclude>
     <ClInclude Include="SHA256\sha256.h" />
+    <ClInclude Include="XOR\xorstr.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\imgui.cpp">

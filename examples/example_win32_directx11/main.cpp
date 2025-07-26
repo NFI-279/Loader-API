@@ -11,35 +11,38 @@
 #include <../misc/freetype/imgui_freetype.h>
 #include <../imgui_internal.h>
 #include <../examples/example_win32_directx11/SHA256/sha256.h>
+#include <../examples/example_win32_directx11/XOR/xorstr.hpp>
 #include <iostream>
 #include <fstream>
 #include <cpr/cpr.h>
 #include <nlohmann/json.hpp>
+#include <Windows.h>
+#include <ShlObj.h>
+#include <wchar.h>
+#include <chrono>
+#include <future>
+#include <cctype>
 using json = nlohmann::json;
 
-// Data
-static ID3D11Device*            g_pd3dDevice = nullptr;
-static ID3D11DeviceContext*     g_pd3dDeviceContext = nullptr;
-static IDXGISwapChain*          g_pSwapChain = nullptr;
+static ID3D11Device* g_pd3dDevice = nullptr;
+static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
+static IDXGISwapChain* g_pSwapChain = nullptr;
 static bool                     g_SwapChainOccluded = false;
 static UINT                     g_ResizeWidth = 0, g_ResizeHeight = 0;
-static ID3D11RenderTargetView*  g_mainRenderTargetView = nullptr;
+static ID3D11RenderTargetView* g_mainRenderTargetView = nullptr;
 
 
-std::string g_activationSecret;
-std::string g_executableHash;
+std::string g_handshakeTokenForActivation;
 
 static bool g_isAnimating = false;
 static float g_animationTime = 0.0f;
 bool is_license_valid = true;
 #define IM_PI 3.14159265358979323846f
-static char g_activationKey[13] = "";
-static bool g_hasActivationBeenAttempted = false;
+static char g_activationKey[51] = "";
 
 ImFont* g_pFont = nullptr;
 
 
-// Forward declarations of helper functions
 bool CreateDeviceD3D(HWND hWnd);
 void CleanupDeviceD3D();
 void CreateRenderTarget();
@@ -51,6 +54,7 @@ enum class LoaderState {
     LOADING,
     ACTIVATION,
     MAIN_LOADER,
+    ERROR_STATE,
 };
 
 enum CheckState {
@@ -58,27 +62,241 @@ enum CheckState {
     CHECKING_UPDATE,
     UPDATING_MODULES,
     NO_UPDATES_FOUND,
+    PERFORMING_SYNC
 };
 
 struct AnimationInfo {
     bool isAnimating = false;
     bool isFadingOut = false;
     bool isFadingIn = false;
-    float alpha = 1.0f; 
+    float alpha = 1.0f;
 };
+
+struct VersionCheckResult {
+    bool request_ok = false;
+    bool update_required = false;
+    std::string handshake_token;
+    std::string original_intent;
+};
+
 
 static LoaderState g_loaderState = LoaderState::INITIAL_CHECK;
 static LoaderState g_nextLoaderState = LoaderState::INITIAL_CHECK;
 static CheckState g_checkState = LOADING_MODULES;
-const std::string g_loaderVersion = "version=1.0.0&checksum=";
-std::string g_versionurl = "http://localhost:4000/api/v1/public/version-check?";
+std::string g_errorMessage;
+
+struct SubscriptionInfo {
+    std::string name;
+    std::string version;
+    std::string patch_note;
+    int days_remaining;
+};
+
+struct ActivationResult {
+    bool success = false;
+    std::vector<SubscriptionInfo> subscriptions;
+    std::string server_error_message;
+};
+
+std::vector <SubscriptionInfo> g_userSubscriptions;
+
+void ConfigureSecureSession(cpr::Session& session) {
+    session.SetUserAgent(cpr::UserAgent{ xorstr_("MyLoader") });
+    session.SetTimeout(cpr::Timeout{ 15000 });
+
+    session.SetOption(cpr::Ssl(cpr::ssl::TLSv1_2{}));
+}
 
 std::wstring getExecutablePath() {
-    const DWORD maxPath = 300;  
+    const DWORD maxPath = 300;
     wchar_t exePath[maxPath];
-    GetModuleFileNameW(NULL, exePath, maxPath);
-    return std::wstring(exePath, maxPath);
+    DWORD length = GetModuleFileNameW(NULL, exePath, maxPath);
+    return std::wstring(exePath, length);
 }
+
+std::string CalculateChecksum() {
+    std::wstring exePath = getExecutablePath(); // Get the executable path
+
+    if (exePath.empty()) {
+        g_loaderState = LoaderState::ERROR_STATE; // Assuming you add ERROR_STATE enum
+        g_errorMessage = "Could not locate application path.";
+        return "";
+    }
+
+    std::ifstream file(exePath.c_str(), std::ios::binary); // Open the executable in binary mode
+    if (file) {
+        std::vector<char> buffer(std::istreambuf_iterator<char>(file), {});
+
+        file.close();
+
+        SHA256 sha256;
+
+        std::string executableHash = sha256(buffer.data(), buffer.size());
+
+        return executableHash;
+    }
+    g_errorMessage = "Failed to open application file for verification.";
+    return "";
+}
+
+
+std::wstring GetSessionFilePath() {
+    wchar_t* locateFolder = NULL;
+    HRESULT path = SHGetKnownFolderPath(FOLDERID_ProgramData, 0, NULL, &locateFolder);
+
+    if (SUCCEEDED(path)) {
+        std::wstring fullPath(locateFolder);
+
+        CoTaskMemFree(locateFolder);
+
+        fullPath += xorstr_(L"\\Loader");
+
+        CreateDirectoryW(fullPath.c_str(), NULL);
+
+        fullPath += xorstr_(L"\\session.dat");
+
+        return fullPath;
+    }
+
+    return L"";
+}
+
+
+bool DoesSessionFileExist() {
+    std::wstring filePath = GetSessionFilePath();
+    if (filePath.empty()) {
+        return false; // The helper failed to get the path.
+    }
+    std::ifstream sessionFile(filePath.c_str());
+    return sessionFile.is_open();
+}
+
+
+bool CreateSessionFile(const std::string& token) {
+    std::wstring filePath = GetSessionFilePath();
+    if (filePath.empty()) {
+        return false;
+    }
+
+    std::ofstream sessionFile(filePath.c_str(), std::ios::out | std::ios::trunc);
+    if (sessionFile.is_open()) {
+        sessionFile << token;
+        sessionFile.close();
+        return true;
+    }
+    return false;
+}
+
+VersionCheckResult checkIntegrity(const std::string& version, const std::string& checksum, const std::string& intent) { // checksum will be g_executableHash
+
+    try {
+
+        const std::string baseUrl = xorstr_("https://server-api-xe36.onrender.com/api/v1/public/version-check?");
+        const std::string versionParam = xorstr_("version=");
+        const std::string checksumParam = xorstr_("&checksum=");
+        const std::string intentParam = xorstr_("&cintent=");
+
+        std::string finalUrl = xorstr_("https://server-api-xe36.onrender.com/api/v1/public/version-check?version=1.0.0&checksum=123&intent=sync");
+
+        //std::string finalUrl = baseUrl + versionParam + version + checksumParam + checksum + intentParam + intent;
+        cpr::Session session;
+        ConfigureSecureSession(session);
+        session.SetUrl(cpr::Url{ finalUrl });
+        cpr::Response res = session.Get();
+
+        //auto res = cpr::Get(cpr::Url{ finalUrl });
+
+        if (res.status_code == 200) {
+
+            VersionCheckResult result;
+            result.request_ok = true;
+            json response = json::parse(res.text);
+
+            // Check the application-level status from the server
+            if (response.value("status", "") == "update_required") {
+                result.update_required = true;
+            }
+
+            result.handshake_token = response.value("handshake_token", "");
+            result.original_intent = intent;
+            return result;
+        }
+
+    }
+    catch (const std::exception& e) {
+        g_errorMessage = "Could not connect to the server.";
+        std::cerr << "Error during integrity check: " << e.what() << std::endl;
+    }
+
+    return {};
+}
+
+
+
+bool SyncPreviousUser(const std::string& handshakeToken) {
+    std::wstring programDataPath = GetSessionFilePath();
+    if (programDataPath.empty()) {
+        return false;
+    }
+
+    std::ifstream sessionFile(programDataPath.c_str());
+
+    if (sessionFile) {
+        std::stringstream buffer;
+        buffer << sessionFile.rdbuf();
+        sessionFile.close();
+        std::string sessionToken = buffer.str();
+
+        sessionToken.erase(std::remove_if(sessionToken.begin(), sessionToken.end(), ::isspace), sessionToken.end());
+
+        std::string hwid = xorstr_("5344151340604444"); // Placeholder
+        json request_body;
+        request_body[xorstr_("hwid")] = hwid;
+        request_body[xorstr_("handshake_token")] = handshakeToken;
+
+        cpr::Header headers{ {xorstr_("Authorization"), "Bearer " + sessionToken}, {xorstr_("Content-Type"), "application/json"} };
+
+        cpr::Session session;
+        ConfigureSecureSession(session);
+
+        session.SetUrl(cpr::Url{ xorstr_("https://server-api-xe36.onrender.com/api/v1/secure/sync") });
+        session.SetHeader(headers);
+        session.SetBody(cpr::Body{ request_body.dump() });
+
+        g_userSubscriptions.clear();
+        cpr::Response res = session.Post();
+
+        if (res.status_code == 200) {
+            try {
+                json response_data = json::parse(res.text);
+                if (response_data.is_array()) {
+                    for (const auto& product : response_data) {
+                        SubscriptionInfo subInfo;
+                        subInfo.name = product["product_name"];
+                        subInfo.version = product["latest_version"];
+                        subInfo.patch_note = product["patch_note"];
+                        subInfo.days_remaining = product["days_remaining"];
+                        g_userSubscriptions.push_back(subInfo);
+                        std::cout << "Subscriptions loaded successfully." << std::endl;
+                    }
+                    return true;
+                }
+                return true; // Sync still succeeded
+            }
+            catch (const json::exception& e) {
+                // _wremove(programDataPath.c_str()); // DEBUG
+                std::cout << "JSON error: " << e.what() << std::endl;
+                return false;
+            }
+        }
+        else {
+            // _wremove(programDataPath.c_str()); // DEBUG
+            return false;
+        }
+    }
+    return false;
+}
+
 
 void setImGuiStyle() {
     ImGuiStyle& style = ImGui::GetStyle();
@@ -125,24 +343,18 @@ AnimationInfo HandleCrossFadeAnimation(bool& isAnimatingFlag, float& timer, floa
 }
 void RenderCenteredText(const char* text)
 {
-    // Get the window size to calculate the center.
     ImVec2 window_size = ImGui::GetWindowSize();
     float localCenterX = window_size.x * 0.5f;
     float localCenterY = window_size.y * 0.5f;
 
-    // Push the font you want to use.
     ImGui::PushFont(g_pFont, 22.0f);
 
-    // Calculate the size of the text to correctly offset it for centering.
     ImVec2 textSize = ImGui::CalcTextSize(text);
 
-    // Set the cursor position before drawing.
     ImGui::SetCursorPos(ImVec2(localCenterX - textSize.x * 0.5f, localCenterY + 45.0f));
 
-    // Draw the text. Using TextUnformatted is slightly faster if you don't have '%' characters.
     ImGui::TextUnformatted(text);
 
-    // Don't forget to pop the font.
     ImGui::PopFont();
 }
 const char* GetTextForSubState(CheckState state) {
@@ -151,57 +363,10 @@ const char* GetTextForSubState(CheckState state) {
     case CHECKING_UPDATE: return "Checking for updates";
     case UPDATING_MODULES: return "Updating software";
     case NO_UPDATES_FOUND: return "No updates found";
+    case PERFORMING_SYNC:  return "Authenticating...";
     default: return "";
     }
 }
-
-void checkIntegrity(std::string url) {
-    try {
-        std::cout << url;
-        auto res = cpr::Get(cpr::Url{ url });
-            //cpr::Parameters{ {"abs", version_str}, {"checksum", "123"}});
-        json integrityData;
-        // Print the get request we make
-        std::cout << "Checking integrity..." << std::endl;
-        switch(res.status_code) {
-            case 200: {
-                std::cout << "Integrity check successful." << std::endl;
-                integrityData = json::parse(res.text);
-                g_activationSecret = integrityData["activation_secret"];
-                break;
-            }
-            case 400: {
-                integrityData = json::parse(res.text);
-                std::cout << "Error: " << integrityData["error"] << std::endl;
-                break;
-            }
-            case 403: {
-                integrityData = json::parse(res.text);
-                std::cout << "Error: " << integrityData["error"] << std::endl;
-                break;
-            }
-            case 404: {
-                integrityData = json::parse(res.text);
-                std::cout << "Error: " << integrityData["error"] << std::endl;
-                break;
-            }   
-            case 409: {
-                integrityData = json::parse(res.text);
-                std::cout << "Error: " << integrityData["error"] << std::endl;
-                break;
-            }
-            default: {
-                std::cerr << "Integrity check failed with status code: " << res.status_code << std::endl;
-                break;
-            }
-        }
-
-    } catch (const std::exception& e) {
-        std::cerr << "Error during integrity check: " << e.what() << std::endl;
-        return;
-    }
-}
-
 
 void RenderLineLoadingAnimation(float deltaTime) {
     ImDrawList* drawList = ImGui::GetWindowDrawList();
@@ -353,7 +518,7 @@ bool DrawStyledInputText(const char* label_text, const char* input_id, char* buf
 
     ImGui::SameLine();
 
-    bool isDisabled = (strlen(buffer) != 12);
+    bool isDisabled = (strlen(buffer) != 50);
     if (isDisabled) {
         ImGui::BeginDisabled();
     }
@@ -402,7 +567,6 @@ void RenderCenteredSpinner(float deltaTime, const char* text) {
 
 
     ImGui::PushFont(g_pFont, 22.0f);
-    //const char* text = "Checking for updates";
     ImVec2 textSize = ImGui::CalcTextSize(text);
     ImGui::SetCursorPos(ImVec2(localCenterX - textSize.x * 0.5f, localCenterY + 45.0f));
     ImGui::Text(text);
@@ -416,13 +580,24 @@ void RenderInitialCheckContent()
     static CheckState current_sub_state = LOADING_MODULES;
     static CheckState next_sub_state;
 
+    static bool startup_sequence_complete = false;
+
+    static std::future<std::string> checksum_future;
+    static std::future<VersionCheckResult> integrity_future;
+    static std::future<bool> sync_future;
+
+    static std::string calculated_checksum = "";
+    static std::string received_handshake = "";
+    static VersionCheckResult result;
+
     static LoaderState last_parent_state = g_loaderState;
     if (g_loaderState != last_parent_state) {
         current_sub_state = LOADING_MODULES;
         isTextAnimating = false;
         textAnimTimer = 0.0f;
-        last_parent_state = g_loaderState; 
+        last_parent_state = g_loaderState;
     }
+
 
     RenderCenteredSpinner(ImGui::GetIO().DeltaTime, "");
 
@@ -445,56 +620,215 @@ void RenderInitialCheckContent()
     }
     ImGui::PopStyleVar();
 
-    if (!isTextAnimating) {
-        switch (current_sub_state) {
-        case LOADING_MODULES:
-            if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-                next_sub_state = CHECKING_UPDATE;
-                isTextAnimating = true;
-                
+    if (ImGui::GetFrameCount() < 2) return;
+    if (startup_sequence_complete) {
+        RenderCenteredText(GetTextForSubState(current_sub_state));
+        return;
+    }
+
+    if (isTextAnimating) return;
+    switch (current_sub_state) {
+        case LOADING_MODULES: {
+            if (!checksum_future.valid()) {
+                checksum_future = std::async(std::launch::async, CalculateChecksum);
+            }
+            if (checksum_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                calculated_checksum = checksum_future.get();
+                if (calculated_checksum.empty()) {
+                    g_loaderState = LoaderState::ERROR_STATE;
+                }
+                else {
+                    next_sub_state = CHECKING_UPDATE;
+                    isTextAnimating = true;
+                }
             }
             break;
-        case CHECKING_UPDATE:
-            if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-                next_sub_state = UPDATING_MODULES;
-                isTextAnimating = true;
+        }
+        case CHECKING_UPDATE: {
+            if (!integrity_future.valid()) {
+                std::string intent = DoesSessionFileExist() ? "sync" : "activate";
+                integrity_future = std::async(std::launch::async, checkIntegrity, xorstr_("1.0.0"), calculated_checksum, "sync");
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_N, false)) {
-                next_sub_state = NO_UPDATES_FOUND;
-                isTextAnimating = true;
+            if (integrity_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+                result = integrity_future.get();
+                if (!result.request_ok) {
+                    g_loaderState = LoaderState::ERROR_STATE;
+                }
+                else if (result.update_required) {
+                    received_handshake = result.handshake_token;
+                    next_sub_state = UPDATING_MODULES;
+                    isTextAnimating = true;
+                }
+                else if (!result.handshake_token.empty()) {
+                    received_handshake = result.handshake_token;
+                    next_sub_state = NO_UPDATES_FOUND;
+                    isTextAnimating = true;
+                }
+                else {
+                    g_errorMessage = "Invalid response from server.";
+                    g_loaderState = LoaderState::ERROR_STATE;
+                }
             }
             break;
-        case UPDATING_MODULES:
-            if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
-                g_nextLoaderState = LoaderState::ACTIVATION;
+        }
+        case UPDATING_MODULES: {
+            break;
+        }
+        case NO_UPDATES_FOUND: {
+            // No update needed now we either sync or go to activation
+            if (result.original_intent == "sync") {
+
+                if (!sync_future.valid()) {  // Check if we have an ongoing sync operation
+                    std::cout << "Syncing previous user with handshake: " << received_handshake << std::endl;
+                    sync_future = std::async(std::launch::async, SyncPreviousUser, received_handshake);
+                }
+                if (sync_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {  // If the worker is done
+                    if (sync_future.get() && !g_userSubscriptions.empty()) {  // If we successfully synced and have subscriptions
+                        g_nextLoaderState = LoaderState::MAIN_LOADER;
+                    }
+                    else { // If sync failed or no subscriptions found
+                        std::cout << "is g_userSubscriptions empty yes or no: " << g_userSubscriptions.empty() << std::endl;
+                        std::cout << "future.get() returned false, indicating sync failed." << std::endl;
+                        std::cout << "Sync failed or no subscriptions found, proceeding to activation." << std::endl;
+                        g_handshakeTokenForActivation = result.handshake_token;
+                        g_nextLoaderState = LoaderState::ACTIVATION;
+                    }
+                    g_isAnimating = true;
+                    startup_sequence_complete = true;
+                }
+            }
+            else if (result.original_intent == "activate") { // If the intent was to activate
+                g_handshakeTokenForActivation = result.handshake_token;
                 g_isAnimating = true;
-            }
-            break;
-        case NO_UPDATES_FOUND:
-            if (ImGui::IsKeyPressed(ImGuiKey_Space, false)) {
+                startup_sequence_complete = true;
                 g_nextLoaderState = LoaderState::ACTIVATION;
-                g_isAnimating = true;
+            }
+            else { // If we got here something went wrong
+                g_nextLoaderState = LoaderState::ACTIVATION;
             }
             break;
         }
     }
 }
 
-void RenderActivationContent() {
-    if (DrawStyledInputText("Enter your license key to proceed", "##activation_key", g_activationKey, sizeof(g_activationKey), 200.0f, g_pFont, ImGuiInputTextFlags_CharsNoBlank))
-    {
-        g_hasActivationBeenAttempted = true; // Record that a check was performed
 
-        if (is_license_valid) {
-            g_nextLoaderState = LoaderState::MAIN_LOADER;
-            g_isAnimating = true;
+
+ActivationResult PerformActivation(const std::string& key, const std::string& hwid, const std::string& handshakeToken) {
+
+    ActivationResult result;
+    try {
+        json request_body;
+        request_body[xorstr_("license")] = key;
+        request_body[xorstr_("hwid")] = hwid;
+        request_body[xorstr_("handshake_token")] = handshakeToken;
+
+        cpr::Response res = cpr::Post(
+            cpr::Url{ xorstr_("https://server-api-xe36.onrender.com/api/v1/public/activate") },
+            cpr::Header{ {xorstr_("Content-Type"), "application/json"} },
+            cpr::Body{ request_body.dump() }
+        );
+        std::cout << res.text << std::endl;
+        if (res.status_code == 200) {
+            // Success
+
+            json response = json::parse(res.text);
+
+            if (response.value("status", "") == "success") {
+                std::string received_token = response.value("token", "");
+                // We try to save the token in session.dat
+                if (!received_token.empty() && CreateSessionFile(received_token)) {
+                    // Session was saved successfully so now parse the subscription data
+                    if (response.contains("subscriptions") && response["subscriptions"].is_array()) {
+                        for (const auto& product : response["subscriptions"]) {
+                            SubscriptionInfo subInfo;
+                            subInfo.name = product.value("product_name", "Unknown");
+                            subInfo.version = product.value("latest_version", "0.0.0");
+                            subInfo.patch_note = product.value("patch_note", "");
+                            subInfo.days_remaining = product.value("days_remaining", 0);
+                            result.subscriptions.push_back(subInfo);
+                        }
+                    }
+                    result.success = true;
+                }
+                else {
+                    result.success = false;
+                    result.server_error_message = "Activation succeeded, but failed to save session.";
+                }
+            }
+            else {
+                result.success = false;
+                result.server_error_message = response.value("message", "Activation failed.");
+            }
+
+        }
+        else {
+            // Failure
+            result.success = false;
+            try {
+                json error_response = json::parse(res.text);
+                result.server_error_message = error_response.value("error", "An unknown error occurred.");
+            }
+            catch (const json::parse_error&) {
+                result.server_error_message = "Received an invalid error response from the server.";
+            }
         }
     }
-    if (g_hasActivationBeenAttempted)
-    {
-        bool is_key_still_invalid = (strlen(g_activationKey) != 12); // Check condition again
-        if (is_key_still_invalid) {
-            ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), "Error: Invalid license key.");
+    catch (const std::exception& e) {
+        result.success = false;
+        result.server_error_message = "A network error occurred during activation.";
+        std::cerr << "Exception in PerformActivation: " << e.what() << std::endl;
+    }
+
+    return result;
+}
+
+void RenderActivationContent() {
+    enum class ActivationState { IDLE, ACTIVATING, FAILED };
+    static ActivationState current_state = ActivationState::IDLE;
+    static std::future<ActivationResult> activation_future;
+    static std::string error_message;
+    if (g_handshakeTokenForActivation.empty()) {
+        g_loaderState = LoaderState::INITIAL_CHECK; // Or show an error message
+        return;
+    }
+
+    if (DrawStyledInputText("Enter your license key to proceed", "##activation_key", g_activationKey, sizeof(g_activationKey), 200.0f, g_pFont, ImGuiInputTextFlags_CharsNoBlank)) {
+        if (current_state == ActivationState::IDLE) {
+            current_state = ActivationState::ACTIVATING;
+            std::string hwid = xorstr_("5344151340604444"); // Placeholder
+
+            std::string token_to_use = g_handshakeTokenForActivation;
+            g_handshakeTokenForActivation.clear(); // Clear the global token
+            activation_future = std::async(std::launch::async, PerformActivation, std::string(g_activationKey), hwid, token_to_use);
+        }
+    }
+
+    if (current_state == ActivationState::ACTIVATING) {
+        RenderCenteredSpinner(ImGui::GetIO().DeltaTime, "");
+
+        if (activation_future.valid() && activation_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
+            ActivationResult result = activation_future.get();
+            if (result.success) {
+                g_userSubscriptions = result.subscriptions;
+                g_nextLoaderState = LoaderState::MAIN_LOADER;
+                g_isAnimating = true;
+                current_state = ActivationState::IDLE;
+            }
+            else {
+                error_message = result.server_error_message;
+                current_state = ActivationState::FAILED;
+            }
+        }
+    }
+
+    if (current_state == ActivationState::FAILED) {
+        ImGui::TextColored(ImVec4(1.0f, 0.2f, 0.2f, 1.0f), error_message.c_str());
+
+        static float error_timer = 0.0f;
+        error_timer += ImGui::GetIO().DeltaTime;
+        if (error_timer > 3.0f) {
+            current_state = ActivationState::IDLE;
+            error_timer = 0.0f;
         }
     }
 }
@@ -504,41 +838,8 @@ void RenderMainLoaderContent()
     ImGui::Text("Loading main application...");
 }
 
-bool InitializeModules() {
-    std::wstring exePath = getExecutablePath(); // Get the executable path
-    std::ifstream file;
-    
-    file.open(exePath.c_str(), std::ios::binary); // Open the executable in binary mode
-    if (file) {
-        std::vector<char> buffer;
-
-        file.seekg(0, std::ios::end); // Go to the end of the file
-        size_t fileSize = file.tellg(); // Read that position to get the file size
-
-        file.seekg(0, std::ios::beg); // Go back to the beginning of the file
-
-        buffer.resize(fileSize); // Resize the buffer to the file size
-
-        file.read(buffer.data(), fileSize); // Read the entire file into the buffer
-
-        file.close();
-
-        SHA256 sha256;
-        g_executableHash = sha256(buffer.data(), fileSize); // Calculate the SHA256 hash of the file
-        std::cout << g_executableHash << std::endl; // Print the SHA256 hash of the file
-        g_versionurl = g_versionurl.append(g_loaderVersion).append(g_executableHash);
-        checkIntegrity(g_versionurl);
-        return true;
-    }
-    else {
-        std::cout << "Failed to open the executable file." << std::endl;
-        return false;
-    }
-}
-
 void RenderApplicationUI()
 {
-    ImGui::ShowMetricsWindow();
     setImGuiStyle();
     static bool first_run = true;
     if (first_run) {
@@ -546,7 +847,6 @@ void RenderApplicationUI()
         ImGui::SetNextWindowPos(viewport_center, ImGuiCond_Appearing, ImVec2(0.5f, 0.5f));
         first_run = false;
     }
-    bool is_key_length_valid = (strlen(g_activationKey) == 12);
 
     ImGui::SetNextWindowSize(ImVec2(300, 200));
     if (ImGui::Begin("Loader", nullptr, ImGuiWindowFlags_NoDecoration))
@@ -583,8 +883,9 @@ void RenderApplicationUI()
                 }
             }
             ImGui::PopStyleVar(1);
-        }else {
-            if (wasAnimating) {
+        }
+        else {
+            if (wasAnimating && !g_isAnimating) {
                 g_loaderState = g_nextLoaderState;
             }
 
@@ -605,7 +906,12 @@ void RenderApplicationUI()
     ImGui::End();
 }
 
-// Main code
+bool InitializeModules() {
+    g_loaderState = LoaderState::INITIAL_CHECK;
+    return true;
+}
+
+
 int main(int, char**)
 {
     // Make process DPI aware and obtain main monitor scale
@@ -635,7 +941,7 @@ int main(int, char**)
     ImGuiIO& io = ImGui::GetIO(); (void)io;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;     // Enable Keyboard Controls
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;      // Enable Gamepad Controls
-   
+
 
 
     // Setup Dear ImGui style
@@ -659,10 +965,7 @@ int main(int, char**)
 
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
-    if (!InitializeModules()) {
-        std::cerr << "Failed to initialize modules." << std::endl;
-        // close the application or reload it
-    }
+    InitializeModules();
 
     // Main loop
     bool done = false;
@@ -711,8 +1014,7 @@ int main(int, char**)
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         // Present
-        HRESULT hr = g_pSwapChain->Present(1, 0);   // Present with vsync
-        //HRESULT hr = g_pSwapChain->Present(0, 0); // Present without vsync
+        HRESULT hr = g_pSwapChain->Present(1, 0);
         g_SwapChainOccluded = (hr == DXGI_STATUS_OCCLUDED);
     }
 
@@ -728,7 +1030,7 @@ int main(int, char**)
     return 0;
 }
 
-// Helper functions
+
 
 bool CreateDeviceD3D(HWND hWnd)
 {
@@ -784,7 +1086,6 @@ void CleanupRenderTarget()
     if (g_mainRenderTargetView) { g_mainRenderTargetView->Release(); g_mainRenderTargetView = nullptr; }
 }
 
-// Forward declare message handler from imgui_impl_win32.cpp
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
 
 // Win32 message handler
