@@ -10,8 +10,8 @@
 #include <../examples/example_win32_directx11/Fonts.h>
 #include <../misc/freetype/imgui_freetype.h>
 #include <../imgui_internal.h>
-#include <../examples/example_win32_directx11/SHA256/sha256.h>
-#include <../examples/example_win32_directx11/XOR/xorstr.hpp>
+#include <../examples/example_win32_directx11/external/SHA256/sha256.h>
+#include <../examples/example_win32_directx11/external/skCrypter.h>
 #include <iostream>
 #include <fstream>
 #include <cpr/cpr.h>
@@ -22,6 +22,7 @@
 #include <chrono>
 #include <future>
 #include <cctype>
+#include <dpapi.h>
 using json = nlohmann::json;
 
 static ID3D11Device* g_pd3dDevice = nullptr;
@@ -101,7 +102,8 @@ struct ActivationResult {
 std::vector <SubscriptionInfo> g_userSubscriptions;
 
 void ConfigureSecureSession(cpr::Session& session) {
-    session.SetUserAgent(cpr::UserAgent{ xorstr_("MyLoader") });
+    auto userAgent = skCrypt("MyLoader");
+    session.SetUserAgent(cpr::UserAgent{ userAgent.decrypt() });
     session.SetTimeout(cpr::Timeout{ 15000 });
 
     session.SetOption(cpr::Ssl(cpr::ssl::TLSv1_2{}));
@@ -119,7 +121,8 @@ std::string CalculateChecksum() {
 
     if (exePath.empty()) {
         g_loaderState = LoaderState::ERROR_STATE; // Assuming you add ERROR_STATE enum
-        g_errorMessage = "Could not locate application path.";
+        auto errorMsg = skCrypt("Could not locate application path.");
+        g_errorMessage = errorMsg.decrypt();
         return "";
     }
 
@@ -135,7 +138,8 @@ std::string CalculateChecksum() {
 
         return executableHash;
     }
-    g_errorMessage = "Failed to open application file for verification.";
+    auto errorMsg = skCrypt("Failed to open application file for verification.");
+    g_errorMessage = errorMsg.decrypt();
     return "";
 }
 
@@ -149,11 +153,14 @@ std::wstring GetSessionFilePath() {
 
         CoTaskMemFree(locateFolder);
 
-        fullPath += xorstr_(L"\\Loader");
+        auto loaderDir = skCrypt(L"\\Loader");
+        auto sessionFileName = skCrypt(L"\\session.dat");
+
+        fullPath += loaderDir.decrypt();
 
         CreateDirectoryW(fullPath.c_str(), NULL);
 
-        fullPath += xorstr_(L"\\session.dat");
+        fullPath += sessionFileName.decrypt();
 
         return fullPath;
     }
@@ -172,7 +179,7 @@ bool DoesSessionFileExist() {
 }
 
 
-bool CreateSessionFile(const std::string& token) {
+bool CreateEncryptedSessionFile(const DATA_BLOB& data) {
     std::wstring filePath = GetSessionFilePath();
     if (filePath.empty()) {
         return false;
@@ -180,31 +187,76 @@ bool CreateSessionFile(const std::string& token) {
 
     std::ofstream sessionFile(filePath.c_str(), std::ios::out | std::ios::trunc);
     if (sessionFile.is_open()) {
-        sessionFile << token;
+        sessionFile.write(reinterpret_cast<const char*>(data.pbData), data.cbData);
         sessionFile.close();
         return true;
     }
     return false;
 }
 
+std::string ReadAndDecryptSessionFile() {
+    std::wstring filePath = GetSessionFilePath();
+    if (filePath.empty()) return "";
+
+    std::ifstream sessionFile(filePath.c_str(), std::ios::in | std::ios::binary | std::ios::ate);
+    if (!sessionFile.is_open()) return "";
+
+    // Read the entire encrypted file into a buffer
+    std::streamsize size = sessionFile.tellg();
+    sessionFile.seekg(0, std::ios::beg);
+    std::vector<char> buffer(size);
+    if (!sessionFile.read(buffer.data(), size)) return "";
+
+    DATA_BLOB dataIn;
+    DATA_BLOB dataOut;
+
+    dataIn.pbData = (BYTE*)buffer.data();
+    dataIn.cbData = buffer.size();
+
+    std::string decryptedToken;
+
+    if (CryptUnprotectData(
+        &dataIn,
+        NULL,
+        NULL,
+        NULL,
+        NULL,
+        CRYPTPROTECT_UI_FORBIDDEN,
+        &dataOut))
+    {
+        // Convert the decrypted blob back into a string
+        decryptedToken.assign((char*)dataOut.pbData, dataOut.cbData);
+        // Free the memory that Windows allocated for the decrypted data
+        LocalFree(dataOut.pbData);
+    }
+
+    return decryptedToken;
+}
+
+
 VersionCheckResult checkIntegrity(const std::string& version, const std::string& checksum, const std::string& intent) { // checksum will be g_executableHash
 
     try {
 
-        const std::string baseUrl = xorstr_("https://server-api-xe36.onrender.com/api/v1/public/version-check?");
-        const std::string versionParam = xorstr_("version=");
-        const std::string checksumParam = xorstr_("&checksum=");
-        const std::string intentParam = xorstr_("&cintent=");
+        auto baseUrl = skCrypt("https://server-api-xe36.onrender.com/api/v1/public/version-check?");
+        auto versionParam = skCrypt("version=");
+        auto checksumParam = skCrypt("&checksum=");
+        auto intentParam = skCrypt("&cintent=");
 
-        std::string finalUrl = xorstr_("https://server-api-xe36.onrender.com/api/v1/public/version-check?version=1.0.0&checksum=123&intent=sync");
+        std::string finalUrlString;
 
-        //std::string finalUrl = baseUrl + versionParam + version + checksumParam + checksum + intentParam + intent;
+#ifdef _DEBUG
+        auto debugUrl = skCrypt("https://server-api-xe36.onrender.com/api/v1/public/version-check?version=1.0.0&checksum=123&intent=sync");
+        finalUrlString = debugUrl.decrypt();
+#else
+        finalUrlString = baseUrl.decrypt() + versionParam.decrypt() + version + checksumParam.decrypt() + checksum + intentParam.decrypt() + intent;
+#endif
+
         cpr::Session session;
         ConfigureSecureSession(session);
-        session.SetUrl(cpr::Url{ finalUrl });
+        session.SetUrl(cpr::Url{ finalUrlString });
         cpr::Response res = session.Get();
 
-        //auto res = cpr::Get(cpr::Url{ finalUrl });
 
         if (res.status_code == 200) {
 
@@ -213,18 +265,19 @@ VersionCheckResult checkIntegrity(const std::string& version, const std::string&
             json response = json::parse(res.text);
 
             // Check the application-level status from the server
-            if (response.value("status", "") == "update_required") {
+            if (response.value(skCrypt("status").decrypt(), "") == skCrypt("update_required").decrypt()) {
                 result.update_required = true;
             }
 
-            result.handshake_token = response.value("handshake_token", "");
+            result.handshake_token = response.value(skCrypt("handshake_token").decrypt(), "");
             result.original_intent = intent;
             return result;
         }
 
     }
     catch (const std::exception& e) {
-        g_errorMessage = "Could not connect to the server.";
+        auto errorMsg = skCrypt("Could not connect to the server.");
+        g_errorMessage = errorMsg.decrypt();
         std::cerr << "Error during integrity check: " << e.what() << std::endl;
     }
 
@@ -234,32 +287,29 @@ VersionCheckResult checkIntegrity(const std::string& version, const std::string&
 
 
 bool SyncPreviousUser(const std::string& handshakeToken) {
-    std::wstring programDataPath = GetSessionFilePath();
-    if (programDataPath.empty()) {
-        return false;
-    }
+    std::string sessionToken = ReadAndDecryptSessionFile();
 
-    std::ifstream sessionFile(programDataPath.c_str());
+    if (!sessionToken.empty()) {
+        auto hwid = skCrypt("5344151340604444"); // Placeholder
+        
+        auto hwid_key = skCrypt("hwid").decrypt();
+        auto token_key = skCrypt("handshake_token").decrypt();
 
-    if (sessionFile) {
-        std::stringstream buffer;
-        buffer << sessionFile.rdbuf();
-        sessionFile.close();
-        std::string sessionToken = buffer.str();
-
-        sessionToken.erase(std::remove_if(sessionToken.begin(), sessionToken.end(), ::isspace), sessionToken.end());
-
-        std::string hwid = xorstr_("5344151340604444"); // Placeholder
         json request_body;
-        request_body[xorstr_("hwid")] = hwid;
-        request_body[xorstr_("handshake_token")] = handshakeToken;
+        request_body[hwid_key] = hwid.decrypt();
+        request_body[token_key] = handshakeToken;
 
-        cpr::Header headers{ {xorstr_("Authorization"), "Bearer " + sessionToken}, {xorstr_("Content-Type"), "application/json"} };
+        auto authKey = skCrypt("Authorization");
+        auto contentTypeKey = skCrypt("Content-Type");
+        auto contentTypeValue = skCrypt("application/json");
+        auto syncUrl = skCrypt("https://server-api-xe36.onrender.com/api/v1/secure/sync");
+
+        cpr::Header headers{ {authKey.decrypt(), "Bearer " + sessionToken}, {contentTypeKey.decrypt(), contentTypeValue.decrypt()} };
 
         cpr::Session session;
         ConfigureSecureSession(session);
 
-        session.SetUrl(cpr::Url{ xorstr_("https://server-api-xe36.onrender.com/api/v1/secure/sync") });
+        session.SetUrl(cpr::Url{ syncUrl.decrypt() });
         session.SetHeader(headers);
         session.SetBody(cpr::Body{ request_body.dump() });
 
@@ -270,27 +320,36 @@ bool SyncPreviousUser(const std::string& handshakeToken) {
             try {
                 json response_data = json::parse(res.text);
                 if (response_data.is_array()) {
+
+                    auto name_key = skCrypt("product_name").decrypt();
+                    auto version_key = skCrypt("latest_version").decrypt();
+                    auto patch_note_key = skCrypt("patch_note").decrypt();
+                    auto days_remaining_key = skCrypt("days_remaining").decrypt();
+
                     for (const auto& product : response_data) {
                         SubscriptionInfo subInfo;
-                        subInfo.name = product["product_name"];
-                        subInfo.version = product["latest_version"];
-                        subInfo.patch_note = product["patch_note"];
-                        subInfo.days_remaining = product["days_remaining"];
+                        subInfo.name = product[name_key];
+                        subInfo.version = product[version_key];
+                        subInfo.patch_note = product[patch_note_key];
+                        subInfo.days_remaining = product[days_remaining_key];
                         g_userSubscriptions.push_back(subInfo);
-                        std::cout << "Subscriptions loaded successfully." << std::endl;
                     }
                     return true;
                 }
                 return true; // Sync still succeeded
             }
-            catch (const json::exception& e) {
-                // _wremove(programDataPath.c_str()); // DEBUG
+            catch (const json::exception& e) { // Decryption worked but server gave bad JSON
+#ifndef _DEBUG
+                 _wremove(GetSessionFilePath().c_str()); // DEBUG
+#endif
                 std::cout << "JSON error: " << e.what() << std::endl;
                 return false;
             }
         }
-        else {
-            // _wremove(programDataPath.c_str()); // DEBUG
+        else { // Server rejected our token
+#ifndef _DEBUG
+             _wremove(GetSessionFilePath().c_str()); // DEBUG
+#endif  
             return false;
         }
     }
@@ -358,13 +417,20 @@ void RenderCenteredText(const char* text)
     ImGui::PopFont();
 }
 const char* GetTextForSubState(CheckState state) {
+    static auto loading_modules_text = skCrypt("Loading modules");
+    static auto checking_update_text = skCrypt("Checking for updates");
+    static auto updating_software_text = skCrypt("Updating software");
+    static auto no_updates_text = skCrypt("No updates found");
+    static auto authenticating_text = skCrypt("Authenticating...");
+    static auto empty_text = skCrypt("");
+
     switch (state) {
-    case LOADING_MODULES: return "Loading modules";
-    case CHECKING_UPDATE: return "Checking for updates";
-    case UPDATING_MODULES: return "Updating software";
-    case NO_UPDATES_FOUND: return "No updates found";
-    case PERFORMING_SYNC:  return "Authenticating...";
-    default: return "";
+    case LOADING_MODULES: return loading_modules_text.decrypt();
+    case CHECKING_UPDATE: return checking_update_text.decrypt();
+    case UPDATING_MODULES: return updating_software_text.decrypt();
+    case NO_UPDATES_FOUND: return no_updates_text.decrypt();
+    case PERFORMING_SYNC:  return authenticating_text.decrypt();
+    default: return empty_text.decrypt();
     }
 }
 
@@ -646,8 +712,13 @@ void RenderInitialCheckContent()
         }
         case CHECKING_UPDATE: {
             if (!integrity_future.valid()) {
-                std::string intent = DoesSessionFileExist() ? "sync" : "activate";
-                integrity_future = std::async(std::launch::async, checkIntegrity, xorstr_("1.0.0"), calculated_checksum, "sync");
+
+                auto sync_intent = skCrypt("sync");
+                auto activate_intent = skCrypt("activate");
+                auto version_str = skCrypt("1.0.0");
+
+                std::string intent = DoesSessionFileExist() ? sync_intent.decrypt() : activate_intent.decrypt();
+                integrity_future = std::async(std::launch::async, checkIntegrity, version_str.decrypt(), calculated_checksum, intent);
             }
             if (integrity_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {
                 result = integrity_future.get();
@@ -665,7 +736,8 @@ void RenderInitialCheckContent()
                     isTextAnimating = true;
                 }
                 else {
-                    g_errorMessage = "Invalid response from server.";
+                    auto errorMsg = skCrypt("Invalid response from server");
+                    g_errorMessage = errorMsg.decrypt();
                     g_loaderState = LoaderState::ERROR_STATE;
                 }
             }
@@ -676,10 +748,11 @@ void RenderInitialCheckContent()
         }
         case NO_UPDATES_FOUND: {
             // No update needed now we either sync or go to activation
-            if (result.original_intent == "sync") {
+            auto sync_intent_str = skCrypt("sync").decrypt();
+
+            if (result.original_intent == sync_intent_str) {
 
                 if (!sync_future.valid()) {  // Check if we have an ongoing sync operation
-                    std::cout << "Syncing previous user with handshake: " << received_handshake << std::endl;
                     sync_future = std::async(std::launch::async, SyncPreviousUser, received_handshake);
                 }
                 if (sync_future.wait_for(std::chrono::seconds(0)) == std::future_status::ready) {  // If the worker is done
@@ -687,9 +760,6 @@ void RenderInitialCheckContent()
                         g_nextLoaderState = LoaderState::MAIN_LOADER;
                     }
                     else { // If sync failed or no subscriptions found
-                        std::cout << "is g_userSubscriptions empty yes or no: " << g_userSubscriptions.empty() << std::endl;
-                        std::cout << "future.get() returned false, indicating sync failed." << std::endl;
-                        std::cout << "Sync failed or no subscriptions found, proceeding to activation." << std::endl;
                         g_handshakeTokenForActivation = result.handshake_token;
                         g_nextLoaderState = LoaderState::ACTIVATION;
                     }
@@ -712,52 +782,94 @@ void RenderInitialCheckContent()
 }
 
 
-
 ActivationResult PerformActivation(const std::string& key, const std::string& hwid, const std::string& handshakeToken) {
 
     ActivationResult result;
     try {
+
+        auto license_key = skCrypt("license").decrypt();
+        auto hwid_key = skCrypt("hwid").decrypt();
+        auto handshake_token_key = skCrypt("handshake_token").decrypt();
+
+        auto activate_url = skCrypt("https://server-api-xe36.onrender.com/api/v1/public/activate").decrypt();
+        auto content_type_key = skCrypt("Content-Type").decrypt();
+        auto content_type_value = skCrypt("application/json").decrypt();
+
         json request_body;
-        request_body[xorstr_("license")] = key;
-        request_body[xorstr_("hwid")] = hwid;
-        request_body[xorstr_("handshake_token")] = handshakeToken;
+        request_body[license_key] = key;
+        request_body[hwid_key] = hwid;
+        request_body[handshake_token_key] = handshakeToken;
 
         cpr::Response res = cpr::Post(
-            cpr::Url{ xorstr_("https://server-api-xe36.onrender.com/api/v1/public/activate") },
-            cpr::Header{ {xorstr_("Content-Type"), "application/json"} },
+            cpr::Url{ activate_url },
+            cpr::Header{ {content_type_key, content_type_value} },
             cpr::Body{ request_body.dump() }
         );
-        std::cout << res.text << std::endl;
+
+
         if (res.status_code == 200) {
             // Success
 
             json response = json::parse(res.text);
 
-            if (response.value("status", "") == "success") {
-                std::string received_token = response.value("token", "");
-                // We try to save the token in session.dat
-                if (!received_token.empty() && CreateSessionFile(received_token)) {
-                    // Session was saved successfully so now parse the subscription data
-                    if (response.contains("subscriptions") && response["subscriptions"].is_array()) {
-                        for (const auto& product : response["subscriptions"]) {
-                            SubscriptionInfo subInfo;
-                            subInfo.name = product.value("product_name", "Unknown");
-                            subInfo.version = product.value("latest_version", "0.0.0");
-                            subInfo.patch_note = product.value("patch_note", "");
-                            subInfo.days_remaining = product.value("days_remaining", 0);
-                            result.subscriptions.push_back(subInfo);
+            auto status_key = skCrypt("status").decrypt();
+            auto success_value = skCrypt("success").decrypt();
+
+            if (response.value(status_key, "") == success_value) {
+                auto token_key = skCrypt("token").decrypt();
+                std::string received_token = response.value(token_key, "");
+
+                if (!received_token.empty()) {
+
+                    DATA_BLOB dataIn;
+                    DATA_BLOB dataOut;
+
+                    dataIn.pbData = (BYTE*)received_token.c_str();
+                    dataIn.cbData = received_token.length();
+
+                    if (CryptProtectData(&dataIn, NULL, NULL, NULL, NULL, CRYPTPROTECT_UI_FORBIDDEN, &dataOut)) {
+                        if (CreateEncryptedSessionFile(dataOut)) {
+
+                            auto subs_key = skCrypt("subscriptions").decrypt();
+                            auto name_key = skCrypt("product_name").decrypt();
+                            auto unknown_name = skCrypt("Unknown").decrypt();
+                            auto version_key = skCrypt("latest_version").decrypt();
+                            auto unknown_version = skCrypt("0.0.0").decrypt();
+                            auto patch_note_key = skCrypt("patch_note").decrypt();
+                            auto unknown_patch = skCrypt("").decrypt();
+                            auto days_key = skCrypt("days_remaining").decrypt();
+
+                            if (response.contains(subs_key) && response[subs_key].is_array()) {
+                                for (const auto& product : response[subs_key]) {
+                                    SubscriptionInfo subInfo;
+                                    subInfo.name = product.value(name_key, unknown_name);
+                                    subInfo.version = product.value(version_key, unknown_version);
+                                    subInfo.patch_note = product.value(patch_note_key, unknown_patch);
+                                    subInfo.days_remaining = product.value(days_key, 0);
+                                    result.subscriptions.push_back(subInfo);
+                                }
+                            }
+                            result.success = true;
                         }
+                        else {
+                            result.success = false;
+                            result.server_error_message = skCrypt("Activation succeeded but failed to save session").decrypt();
+                        }
+                        LocalFree(dataOut.pbData);
                     }
-                    result.success = true;
+                    else { // Encryption failed
+                        result.success = false;
+                        result.server_error_message = skCrypt("Failed to secure session on this device").decrypt();
+                    }
                 }
                 else {
                     result.success = false;
-                    result.server_error_message = "Activation succeeded, but failed to save session.";
+                    result.server_error_message = skCrypt("Activation succeeded but received an empty token").decrypt();
                 }
             }
             else {
                 result.success = false;
-                result.server_error_message = response.value("message", "Activation failed.");
+                result.server_error_message = response.value(skCrypt("message").decrypt(), skCrypt("Activation failed").decrypt());
             }
 
         }
@@ -766,17 +878,16 @@ ActivationResult PerformActivation(const std::string& key, const std::string& hw
             result.success = false;
             try {
                 json error_response = json::parse(res.text);
-                result.server_error_message = error_response.value("error", "An unknown error occurred.");
+                result.server_error_message = error_response.value(skCrypt("error").decrypt(), skCrypt("An unknown error occurred").decrypt());
             }
             catch (const json::parse_error&) {
-                result.server_error_message = "Received an invalid error response from the server.";
+                result.server_error_message = skCrypt("Received an invalid error response from the server").decrypt();
             }
         }
     }
     catch (const std::exception& e) {
         result.success = false;
-        result.server_error_message = "A network error occurred during activation.";
-        std::cerr << "Exception in PerformActivation: " << e.what() << std::endl;
+        result.server_error_message = skCrypt("A network error occurred during activation").decrypt();
     }
 
     return result;
@@ -788,14 +899,18 @@ void RenderActivationContent() {
     static std::future<ActivationResult> activation_future;
     static std::string error_message;
     if (g_handshakeTokenForActivation.empty()) {
-        g_loaderState = LoaderState::INITIAL_CHECK; // Or show an error message
+        g_loaderState = LoaderState::INITIAL_CHECK;
         return;
     }
 
-    if (DrawStyledInputText("Enter your license key to proceed", "##activation_key", g_activationKey, sizeof(g_activationKey), 200.0f, g_pFont, ImGuiInputTextFlags_CharsNoBlank)) {
+    auto title_text = skCrypt("Enter your license key to proceed");
+
+    if (DrawStyledInputText(title_text.decrypt(), "##activation_key", g_activationKey, sizeof(g_activationKey), 200.0f, g_pFont, ImGuiInputTextFlags_CharsNoBlank)) {
         if (current_state == ActivationState::IDLE) {
             current_state = ActivationState::ACTIVATING;
-            std::string hwid = xorstr_("5344151340604444"); // Placeholder
+            auto hwid_placeholder = skCrypt("5344151340604444"); // Placeholder
+
+            std::string hwid = hwid_placeholder.decrypt();
 
             std::string token_to_use = g_handshakeTokenForActivation;
             g_handshakeTokenForActivation.clear(); // Clear the global token

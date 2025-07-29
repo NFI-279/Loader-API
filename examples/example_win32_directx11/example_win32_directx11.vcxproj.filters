@@ -27,8 +27,10 @@
     <ClInclude Include="Fonts.h">
       <Filter>sources</Filter>
     </ClInclude>
-    <ClInclude Include="SHA256\sha256.h" />
     <ClInclude Include="XOR\xorstr.hpp" />
+    <ClInclude Include="XOR\skCrypter.h" />
+    <ClInclude Include="external\skCrypter.h" />
+    <ClInclude Include="external\SHA256\sha256.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="..\..\imgui.cpp">
@@ -56,7 +58,7 @@
       <Filter>imgui</Filter>
     </ClCompile>
     <ClCompile Include="..\..\misc\freetype\imgui_freetype.cpp" />
-    <ClCompile Include="SHA256\sha256.cpp" />
+    <ClCompile Include="external\SHA256\sha256.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\README.txt" />

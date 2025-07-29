@@ -165,8 +165,10 @@
     <ClInclude Include="..\..\imgui_internal.h" />
     <ClInclude Include="..\..\backends\imgui_impl_dx11.h" />
     <ClInclude Include="..\..\backends\imgui_impl_win32.h" />
+    <ClInclude Include="external\SHA256\sha256.h" />
+    <ClInclude Include="external\skCrypter.h" />
     <ClInclude Include="Fonts.h" />
-    <ClInclude Include="SHA256\sha256.h" />
+    <ClInclude Include="XOR\skCrypter.h" />
     <ClInclude Include="XOR\xorstr.hpp" />
   </ItemGroup>
   <ItemGroup>
@@ -178,8 +180,8 @@
     <ClCompile Include="..\..\backends\imgui_impl_dx11.cpp" />
     <ClCompile Include="..\..\backends\imgui_impl_win32.cpp" />
     <ClCompile Include="..\..\misc\freetype\imgui_freetype.cpp" />
+    <ClCompile Include="external\SHA256\sha256.cpp" />
     <ClCompile Include="main.cpp" />
-    <ClCompile Include="SHA256\sha256.cpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="..\..\misc\debuggers\imgui.natstepfilter" />
